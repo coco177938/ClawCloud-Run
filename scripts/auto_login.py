@@ -10,6 +10,7 @@ import os
 import sys
 import time
 import base64
+import re
 import requests
 from playwright.sync_api import sync_playwright
 
@@ -53,6 +54,67 @@ class Telegram:
                 )
         except:
             pass
+    
+    def flush_updates(self):
+        """刷新 offset 到最新，避免读到旧消息"""
+        if not self.ok:
+            return 0
+        try:
+            r = requests.get(
+                f"https://api.telegram.org/bot{self.token}/getUpdates",
+                params={"timeout": 0},
+                timeout=10
+            )
+            data = r.json()
+            if data.get("ok") and data.get("result"):
+                return data["result"][-1]["update_id"] + 1
+        except:
+            pass
+        return 0
+    
+    def wait_code(self, timeout=120):
+        """
+        等待你在 TG 里发 /code 123456
+        只接受来自 TG_CHAT_ID 的消息
+        """
+        if not self.ok:
+            return None
+        
+        # 先刷新 offset，避免读到旧的 /code
+        offset = self.flush_updates()
+        deadline = time.time() + timeout
+        pattern = re.compile(r"^/code\s+(\d{6,8})$")  # 6位TOTP 或 8位恢复码也行
+        
+        while time.time() < deadline:
+            try:
+                r = requests.get(
+                    f"https://api.telegram.org/bot{self.token}/getUpdates",
+                    params={"timeout": 20, "offset": offset},
+                    timeout=30
+                )
+                data = r.json()
+                if not data.get("ok"):
+                    time.sleep(2)
+                    continue
+                
+                for upd in data.get("result", []):
+                    offset = upd["update_id"] + 1
+                    msg = upd.get("message") or {}
+                    chat = msg.get("chat") or {}
+                    if str(chat.get("id")) != str(self.chat_id):
+                        continue
+                    
+                    text = (msg.get("text") or "").strip()
+                    m = pattern.match(text)
+                    if m:
+                        return m.group(1)
+            
+            except Exception:
+                pass
+            
+            time.sleep(2)
+        
+        return None
 
 
 class SecretUpdater:
@@ -258,6 +320,116 @@ class AutoLogin:
         self.tg.send("❌ <b>两步验证超时</b>")
         return False
     
+    def handle_2fa_code_input(self, page):
+        """处理 TOTP 验证码输入（通过 Telegram 发送 /code 123456）"""
+        self.log("需要输入验证码", "WARN")
+        shot = self.shot(page, "两步验证_code")
+        
+        # 先尝试点击"Use an authentication app"或类似按钮（如果在 mobile 页面）
+        try:
+            more_options = [
+                'a:has-text("Use an authentication app")',
+                'a:has-text("Enter a code")',
+                'button:has-text("Use an authentication app")',
+                '[href*="two-factor/app"]'
+            ]
+            for sel in more_options:
+                try:
+                    el = page.locator(sel).first
+                    if el.is_visible(timeout=2000):
+                        el.click()
+                        time.sleep(2)
+                        page.wait_for_load_state('networkidle', timeout=15000)
+                        self.log("已切换到验证码输入页面", "SUCCESS")
+                        shot = self.shot(page, "两步验证_code_切换后")
+                        break
+                except:
+                    pass
+        except:
+            pass
+        
+        # 发送提示并等待验证码
+        self.tg.send(f"""🔐 <b>需要验证码登录</b>
+
+请在 Telegram 里发送：
+<code>/code 你的6位验证码</code>
+
+等待时间：{TWO_FACTOR_WAIT} 秒""")
+        if shot:
+            self.tg.photo(shot, "两步验证页面")
+        
+        self.log(f"等待验证码（{TWO_FACTOR_WAIT}秒）...", "WARN")
+        code = self.tg.wait_code(timeout=TWO_FACTOR_WAIT)
+        
+        if not code:
+            self.log("等待验证码超时", "ERROR")
+            self.tg.send("❌ <b>等待验证码超时</b>")
+            return False
+        
+        # 不打印验证码明文，只提示收到
+        self.log("收到验证码，正在填入...", "SUCCESS")
+        self.tg.send("✅ 收到验证码，正在填入...")
+        
+        # 常见 OTP 输入框 selector（优先级排序）
+        selectors = [
+            'input[autocomplete="one-time-code"]',
+            'input[name="app_otp"]',
+            'input[name="otp"]',
+            'input#app_totp',
+            'input#otp',
+            'input[inputmode="numeric"]'
+        ]
+        
+        for sel in selectors:
+            try:
+                el = page.locator(sel).first
+                if el.is_visible(timeout=2000):
+                    el.fill(code)
+                    self.log(f"已填入验证码", "SUCCESS")
+                    time.sleep(1)
+                    
+                    # 优先点击 Verify 按钮，不行再 Enter
+                    submitted = False
+                    verify_btns = [
+                        'button:has-text("Verify")',
+                        'button[type="submit"]',
+                        'input[type="submit"]'
+                    ]
+                    for btn_sel in verify_btns:
+                        try:
+                            btn = page.locator(btn_sel).first
+                            if btn.is_visible(timeout=1000):
+                                btn.click()
+                                submitted = True
+                                self.log("已点击 Verify 按钮", "SUCCESS")
+                                break
+                        except:
+                            pass
+                    
+                    if not submitted:
+                        page.keyboard.press("Enter")
+                        self.log("已按 Enter 提交", "SUCCESS")
+                    
+                    time.sleep(3)
+                    page.wait_for_load_state('networkidle', timeout=30000)
+                    self.shot(page, "验证码提交后")
+                    
+                    # 检查是否通过
+                    if "github.com/sessions/two-factor/" not in page.url:
+                        self.log("验证码验证通过！", "SUCCESS")
+                        self.tg.send("✅ <b>验证码验证通过</b>")
+                        return True
+                    else:
+                        self.log("验证码可能错误", "ERROR")
+                        self.tg.send("❌ <b>验证码可能错误，请检查后重试</b>")
+                        return False
+            except:
+                pass
+        
+        self.log("没找到验证码输入框", "ERROR")
+        self.tg.send("❌ <b>没找到验证码输入框</b>")
+        return False
+    
     def login_github(self, page, context):
         """登录 GitHub"""
         self.log("登录 GitHub...", "STEP")
@@ -310,9 +482,15 @@ class AutoLogin:
                     pass
             
             else:
-                # 其它两步验证方式（比如 app/otp 输入页），本脚本没自动填码就先失败
-                self.tg.send("❌ <b>需要两步验证（非 Mobile）</b>")
-                return False
+                # 其它两步验证方式（TOTP/恢复码等），尝试通过 Telegram 输入验证码
+                if not self.handle_2fa_code_input(page):
+                    return False
+                # 通过后等页面稳定
+                try:
+                    page.wait_for_load_state('networkidle', timeout=30000)
+                    time.sleep(2)
+                except:
+                    pass
         
         # 错误
         try:
